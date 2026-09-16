@@ -6,7 +6,7 @@ __pycache__/
 venv/
 .pytest_cache/
 cache.sqlite3
-eval/out/
+eval/out/*.log
 *.egg-info/
 docs/answer.html
 docs/*.pdf
