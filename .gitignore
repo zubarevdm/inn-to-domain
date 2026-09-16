@@ -8,3 +8,5 @@ venv/
 cache.sqlite3
 eval/out/
 *.egg-info/
+docs/answer.html
+docs/*.pdf
