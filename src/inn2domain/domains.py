@@ -20,14 +20,29 @@ SITE_PLATFORMS = {
 }
 
 # Агрегаторы реквизитов, госреестры, соцсети, маркетплейсы, СМИ, карты, работа.
-# Ни один из них не может быть ответом "официальный сайт организации".
-BLOCKED_DOMAINS = {
+#
+# Полностью выкидывать их нельзя: каждый такой портал сам является сайтом
+# какой-то организации (ozon.ru — сайт ООО "Интернет Решения", yandex.ru —
+# сайт ООО "Яндекс"). Поэтому правило мягче: такой домен проходит дальше
+# только если реквизиты организации найдены на его главной или странице
+# контактов. Чужие ИНН эти площадки публикуют на глубоких страницах
+# (карточка продавца, карточка контрагента, вакансия), куда пайплайн не ходит,
+# так что ложных срабатываний это не добавляет.
+RESTRICTED_DOMAINS = {
     # агрегаторы отчётности и реквизитов
     "rusprofile.ru", "list-org.com", "checko.ru", "zachestnyibiznes.ru", "sbis.ru",
     "audit-it.ru", "kartoteka.ru", "sparkinterfax.ru", "spark-interfax.ru", "seldon.ru",
     "synapsenet.ru", "testfirm.ru", "vypiska-nalog.com", "e-disclosure.ru",
     "delovoy-profil.ru", "ogrn.online", "vestnik-gosreg.ru", "damia.ru",
     "kontur.ru", "kontur-f.ru", "sbis24.ru", "rbc.ru",
+    # найдены при разметке выборки: тоже публикуют реквизиты чужих организаций
+    "star-pro.ru", "prima-inform.ru", "datanewton.ru", "b2b.house", "vbankcenter.ru",
+    "1prime.ru", "klerk.ru", "b2b-center.ru", "vbr.ru", "sravni.ru", "pikabu.ru",
+    "rusbase.com", "zaimo.ru", "sbercrm.ru", "companies.wiki", "kompaniya.org",
+    "sbis.com", "ru-bezh.ru", "vipiska-nalog.com", "egrul.ru", "ogrn.ru",
+    # сайты банков и сервисов со встроенной проверкой контрагентов
+    "saby.ru", "tochka.com", "tbank.ru", "alfabank.ru", "sberbank.ru", "vtb.ru",
+    "modulbank.ru", "psbank.ru", "open.ru", "raiffeisen.ru", "gazprombank.ru",
     # госресурсы
     "nalog.gov.ru", "nalog.ru", "egrul.nalog.ru", "zakupki.gov.ru", "bus.gov.ru",
     "fedresurs.ru", "gosuslugi.ru", "kad.arbitr.ru", "sudact.ru", "pb.nalog.ru",
@@ -99,19 +114,20 @@ def registrable_domain(host: str | None) -> str | None:
     return ".".join(parts[-2:]) if len(parts) > 2 else host
 
 
-def is_blocked(domain: str | None) -> bool:
+def is_restricted(domain: str | None) -> bool:
+    """Домен допустим только при подтверждённых реквизитах на главной или в контактах."""
     if not domain:
         return True
-    if domain in BLOCKED_DOMAINS:
+    if domain in RESTRICTED_DOMAINS:
         return True
-    # поддомены заблокированных ресурсов (companies.rbc.ru и т.п.)
-    return any(domain.endswith("." + blocked) for blocked in BLOCKED_DOMAINS)
+    # поддомены тех же ресурсов (companies.rbc.ru и т.п.)
+    return any(domain.endswith("." + restricted) for restricted in RESTRICTED_DOMAINS)
 
 
 def domain_from_email(email: str | None) -> str | None:
     if not email or "@" not in email:
         return None
     domain = registrable_domain(email.rsplit("@", 1)[1])
-    if not domain or domain in FREE_MAIL_DOMAINS or is_blocked(domain):
+    if not domain or domain in FREE_MAIL_DOMAINS or is_restricted(domain):
         return None
     return domain

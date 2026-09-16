@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from inn2domain.domains import domain_from_email, is_blocked, normalize_host, registrable_domain
+from inn2domain.domains import domain_from_email, is_restricted, normalize_host, registrable_domain
 from inn2domain.extract import brand_matches_domain, find_requisite, name_similarity
 from inn2domain.inn import inn_kind, is_valid_inn, is_valid_ogrn
 from inn2domain.card import strip_opf
@@ -41,10 +41,11 @@ def test_registrable_domain():
     assert registrable_domain("https://firma.msk.ru/") == "firma.msk.ru"
 
 
-def test_blocklist():
-    assert is_blocked("rusprofile.ru")
-    assert is_blocked("companies.rbc.ru")
-    assert not is_blocked("dadata.ru")
+def test_restricted_list():
+    assert is_restricted("rusprofile.ru")
+    assert is_restricted("companies.rbc.ru")
+    assert is_restricted("ozon.ru")  # портал допускается только по реквизитам
+    assert not is_restricted("dadata.ru")
 
 
 def test_domain_from_email():

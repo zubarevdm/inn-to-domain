@@ -37,6 +37,10 @@ CONTACT_PATHS = (
     "/privacy", "/policy", "/oferta", "/info",
 )
 
+# Если ссылок на реквизиты в разметке не нашлось (одностраничники, сайты на JS),
+# пробуем типовые адреса напрямую.
+PROBE_PATHS = ("/contacts", "/kontakty", "/about", "/company", "/rekvizity", "/privacy")
+
 
 def decode(content: bytes, declared: str | None) -> str:
     """Кодировку часто объявляют только в meta, а windows-1251 на рунете жив."""

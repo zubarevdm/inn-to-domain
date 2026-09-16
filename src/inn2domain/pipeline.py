@@ -16,23 +16,37 @@
 """
 from __future__ import annotations
 
+import re
 import time
 
 from .cache import Cache
 from .card import DaDataCardSource
 from .config import Settings, get_settings
-from .domains import domain_from_email, is_blocked, registrable_domain
+from .domains import domain_from_email, is_restricted, registrable_domain
 from .extract import brand_matches_domain, find_requisite, name_similarity
-from .fetch import PageFetcher, contact_links, html_to_text, page_title
+from .fetch import PROBE_PATHS, PageFetcher, contact_links, html_to_text, page_title
 from .inn import inn_kind, is_valid_inn, normalize_inn
 from .llm import GigaChatClient, GigaChatError, SYSTEM_PROMPT, build_user_prompt, parse_json_object
 from .models import Candidate, Company, LLMVerdict, PageEvidence, Result, SearchHit
 from .search import build_search_provider
+from .whois import owner as whois_owner, owner_similarity
 
 MAX_CANDIDATES_TO_VERIFY = 5
-MAX_CONTACT_PAGES = 2
+MAX_CONTACT_PAGES = 3
 MAX_LLM_ROUNDS = 2
 CONFIDENT_LLM_THRESHOLD = 0.6
+RESTRICTED_FLAG = "портал или агрегатор: принимается только по опубликованным реквизитам"
+SNIPPET_FLAG = "домен упомянут в тексте поисковой выдачи"
+
+# Домен, написанный словами в заголовке или сниппете ("Сайт: ozon.ru").
+DOMAIN_IN_TEXT = re.compile(
+    r"\b((?:[a-z0-9][a-z0-9-]{1,30}\.)+(?:ru|su|com|net|org|io|tech|pro|online|store|shop|info|biz))\b",
+    re.I,
+)
+
+
+def _is_restricted_candidate(candidate: Candidate) -> bool:
+    return RESTRICTED_FLAG in candidate.flags
 
 
 class Pipeline:
@@ -60,30 +74,52 @@ class Pipeline:
             print(f"  · {message}")
 
     def build_queries(self, company: Company) -> list[str]:
-        """Запрос по одному ИНН выводит агрегаторы, поэтому основной вес — на названии."""
-        queries = [f'"{company.inn}"']
+        """Запросы бьют в три разные стороны, потому что каждая по отдельности слепа.
+
+        Поиск по одному ИНН выводит агрегаторы реквизитов, зато их сниппеты
+        нередко содержат адрес сайта. Поиск по названию юрлица бесполезен, когда
+        бренд с ним не совпадает (ООО "Интернет Решения" — это ozon.ru).
+        Поиск по названию с городом помогает малому бизнесу с типовым именем.
+        """
+        queries = [f'"{company.inn}"', f"ИНН {company.inn} сайт компании"]
         brand = company.brand
         if brand:
             queries.append(f'"{brand}" официальный сайт')
             if company.city:
                 queries.append(f'"{brand}" {company.city}')
         if company.name_short and company.name_short != brand:
-            queries.append(f'{company.name_short} сайт')
-        if not brand:
-            queries.append(f"ИНН {company.inn} официальный сайт компании")
-        return queries[:4]
+            queries.append(f"{company.name_short} сайт")
+        return queries[:5]
 
     def collect_candidates(self, hits: list[SearchHit], company: Company) -> list[Candidate]:
         by_domain: dict[str, Candidate] = {}
         for hit in hits:
             domain = registrable_domain(hit.url)
-            if not domain or is_blocked(domain):
+            if not domain:
                 continue
             candidate = by_domain.setdefault(domain, Candidate(domain=domain))
+            if is_restricted(domain) and RESTRICTED_FLAG not in candidate.flags:
+                candidate.flags.append(RESTRICTED_FLAG)
             candidate.hits.append(hit)
             candidate.best_position = min(candidate.best_position, hit.position)
             if hit.query not in candidate.queries:
                 candidate.queries.append(hit.query)
+        # Домены, упомянутые в тексте выдачи. Карточку агрегатора вернуть нельзя,
+        # но написанный в ней адрес сайта — законная подсказка: дальше домен
+        # проходит ту же проверку реквизитов, что и все остальные кандидаты.
+        for hit in hits:
+            for mention in DOMAIN_IN_TEXT.findall(f"{hit.title} {hit.snippet}"):
+                domain = registrable_domain(mention)
+                if not domain or domain in by_domain:
+                    continue
+                candidate = by_domain.setdefault(domain, Candidate(domain=domain))
+                candidate.flags.append(SNIPPET_FLAG)
+                candidate.best_position = min(candidate.best_position, hit.position)
+                if is_restricted(domain):
+                    candidate.flags.append(RESTRICTED_FLAG)
+                if hit.query not in candidate.queries:
+                    candidate.queries.append(hit.query)
+
         # домен корпоративной почты из ЕГРЮЛ — отдельный кандидат
         for email in company.emails:
             domain = domain_from_email(email)
@@ -97,10 +133,11 @@ class Pipeline:
     @staticmethod
     def _prior_score(candidate: Candidate, company: Company) -> float:
         """Предварительный вес — только по выдаче, до загрузки страниц."""
-        score = 0.0
+        score = -1.0 if _is_restricted_candidate(candidate) else 0.0
         score += max(0.0, 1.0 - (candidate.best_position - 1) * 0.12)
         score += 0.35 * (len(candidate.queries) - 1)
         score += 0.6 if candidate.from_email else 0.0
+        score += 0.8 if SNIPPET_FLAG in candidate.flags else 0.0
         score += 0.5 * brand_matches_domain(company.brand, candidate.domain)
         text = " ".join(f"{h.title} {h.snippet}" for h in candidate.hits)
         if company.inn in text.replace(" ", ""):
@@ -110,6 +147,14 @@ class Pipeline:
 
     def verify_candidate(self, candidate: Candidate, company: Company) -> None:
         """Качаем сайт и ищем на нём реквизиты организации."""
+        org, whois_inn, created = whois_owner(candidate.domain, self.cache)
+        candidate.domain_created = created
+        candidate.whois_owner = org
+        if whois_inn and normalize_inn(whois_inn) == normalize_inn(company.inn):
+            candidate.whois_inn_match = True
+            candidate.flags.append("ИНН владельца домена из WHOIS совпал")
+        elif owner_similarity(org, company.name_short, company.brand) >= 0.8:
+            candidate.flags.append(f"владелец домена по WHOIS: {org}")
         urls = [f"https://{candidate.domain}/"]
         seen: set[str] = set()
         while urls:
@@ -138,6 +183,7 @@ class Pipeline:
                 inn_context=inn_context or ogrn_context,
                 developer_mention=(inn_dev and inn_found) or (ogrn_dev and ogrn_found),
                 name_similarity=name_similarity(company.brand or company.name_short, text),
+                city_found=bool(company.city and company.city.lower() in text.lower()),
                 excerpt=text[:900],
                 error=error,
             )
@@ -149,7 +195,11 @@ class Pipeline:
             if inn_found or ogrn_found:
                 break
             if html and len(candidate.evidence) == 1:
-                urls.extend(contact_links(html, url, limit=MAX_CONTACT_PAGES))
+                found = contact_links(html, url, limit=MAX_CONTACT_PAGES)
+                probes = [f"https://{candidate.domain}{path}" for path in PROBE_PATHS]
+                for extra in found + probes:
+                    if extra not in urls and extra not in seen:
+                        urls.append(extra)
         candidate.score = round(candidate.score + self._evidence_bonus(candidate, company), 3)
 
     @staticmethod
@@ -235,7 +285,13 @@ class Pipeline:
             return result
 
         if self.mode == "search_only":
-            best = candidates[0]
+            plain = [c for c in candidates if not _is_restricted_candidate(c)]
+            if not plain:
+                result.reason = "Базовый режим: в выдаче только порталы и агрегаторы"
+                result.decided_by = "no-candidates"
+                result.stats["elapsed_sec"] = round(time.time() - started, 2)
+                return result
+            best = plain[0]
             result.domain = best.domain
             result.confidence = 0.5
             result.reason = "Базовый режим: первый неагрегатор из выдачи"
@@ -246,9 +302,28 @@ class Pipeline:
 
         for candidate in candidates[:MAX_CANDIDATES_TO_VERIFY]:
             self.verify_candidate(candidate, company)
+        # Портал остаётся в игре, если реквизиты подтверждены, либо домен и есть
+        # бренд организации (ООО "ЯНДЕКС" -> yandex.ru), либо его назвала карточка
+        # агрегатора. Иначе он вылетает: чужие реквизиты такие площадки публикуют
+        # пачками, и принимать их за сайт компании нельзя.
+        candidates = [
+            c
+            for c in candidates
+            if not _is_restricted_candidate(c)
+            or c.inn_confirmed
+            or c.ogrn_confirmed
+            or SNIPPET_FLAG in c.flags
+            or brand_matches_domain(company.brand, c.domain) >= 0.75
+        ]
+        candidates = [c for c in candidates if c.evidence]  # без проверки в решение не пускаем
         candidates.sort(key=lambda c: -c.score)
         result.candidates = candidates[:MAX_CANDIDATES_TO_VERIFY]
         result.stats["pages_fetched"] = sum(len(c.evidence) for c in candidates)
+        if not candidates:
+            result.reason = "После проверки не осталось ни одного допустимого кандидата"
+            result.decided_by = "no-candidates"
+            result.stats["elapsed_sec"] = round(time.time() - started, 2)
+            return result
 
         confirmed = [c for c in candidates if c.inn_confirmed or c.ogrn_confirmed]
 
@@ -332,9 +407,48 @@ class Pipeline:
 
         if verdict and verdict.domain and verdict.confidence >= CONFIDENT_LLM_THRESHOLD:
             candidate = next((c for c in result.candidates if c.domain == verdict.domain), None)
-            if candidate and not candidate.reachable:
+            if candidate is None or not candidate.reachable:
                 result.reason = "LLM выбрала домен, но сайт не открывается"
                 result.decided_by = "unreachable"
+                return
+            # Реквизитов нет, значит решение держится на косвенных признаках.
+            # Требуем хотя бы один независимый: название на странице, совпадение
+            # бренда с доменом или упоминание домена в карточке организации.
+            if _is_restricted_candidate(candidate) and not (
+                candidate.inn_confirmed
+                or candidate.ogrn_confirmed
+                or brand_matches_domain(
+                    result.company.brand if result.company else None, candidate.domain
+                )
+                >= 0.75
+            ):
+                # площадка с чужими реквизитами не может выиграть по мнению модели
+                result.reason = (
+                    f"LLM выбрала портал или агрегатор ({verdict.domain}) "
+                    "без подтверждения реквизитами"
+                )
+                result.decided_by = "restricted-without-evidence"
+                return
+            # Реквизитов нет, значит решение держится на косвенных признаках.
+            # Одного совпадения названия мало: у ООО "Пласт" из Петербурга и у
+            # сайта plast.ru из Москвы название совпадает полностью, а компании
+            # разные. Поэтому нужен либо адрес сайта из карточки организации,
+            # либо совпадение бренда с доменом вместе с городом на странице.
+            brand_match = brand_matches_domain(
+                result.company.brand if result.company else None, candidate.domain
+            )
+            support = (
+                SNIPPET_FLAG in candidate.flags
+                or candidate.from_email
+                or (brand_match >= 0.8 and candidate.city_confirmed)
+            )
+            if not support:
+                result.reason = (
+                    "Реквизитов на сайте нет, косвенные признаки слабые "
+                    f"(совпадение бренда {brand_match}, город на сайте "
+                    f"{candidate.city_confirmed}): версия LLM ({verdict.domain}) не принята"
+                )
+                result.decided_by = "weak-support"
                 return
             result.domain = verdict.domain
             result.confidence = round(min(0.85, verdict.confidence), 2)

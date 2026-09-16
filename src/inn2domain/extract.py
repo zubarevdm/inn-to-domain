@@ -98,20 +98,28 @@ def brand_matches_domain(brand: str | None, domain: str | None) -> float:
     """
     if not brand or not domain:
         return 0.0
-    table = {
+    base = {
         "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
         "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
         "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c",
         "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e",
         "ю": "yu", "я": "ya",
     }
-    translit = "".join(table.get(ch, ch) for ch in brand.lower() if ch.isalnum() or ch.isspace())
-    translit = translit.replace(" ", "")
+    # Одной таблицы мало: "Яндекс" пишут и yandeks, и yandex. Проверяем варианты.
+    variants = [base, {**base, "ю": "u", "я": "a", "й": "i"}]
+    cleaned = "".join(ch for ch in brand.lower() if ch.isalnum() or ch.isspace())
     second_level = domain.split(".")[0].replace("-", "")
-    if not translit or not second_level:
+    if not cleaned or not second_level:
         return 0.0
-    if translit == second_level:
-        return 1.0
-    if translit in second_level or second_level in translit:
-        return 0.8
-    return fuzzy_ratio(translit, second_level)
+    best = 0.0
+    for table in variants:
+        for source in (cleaned, cleaned.replace("кс", "x")):
+            translit = "".join(table.get(ch, ch) for ch in source).replace(" ", "")
+            if not translit:
+                continue
+            if translit == second_level:
+                return 1.0
+            if translit in second_level or second_level in translit:
+                best = max(best, 0.8)
+            best = max(best, fuzzy_ratio(translit, second_level))
+    return round(best, 3)

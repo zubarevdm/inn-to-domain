@@ -45,6 +45,7 @@ class PageEvidence(BaseModel):
     inn_context: str | None = None
     developer_mention: bool = False
     name_similarity: float = 0.0
+    city_found: bool = False
     excerpt: str = ""
     error: str | None = None
 
@@ -56,11 +57,16 @@ class Candidate(BaseModel):
     best_position: int = 99
     evidence: list[PageEvidence] = Field(default_factory=list)
     from_email: bool = False
+    domain_created: str | None = None
+    whois_owner: str | None = None
+    whois_inn_match: bool = False
     score: float = 0.0
     flags: list[str] = Field(default_factory=list)
 
     @property
     def inn_confirmed(self) -> bool:
+        if self.whois_inn_match:
+            return True
         return any(e.inn_found and not e.developer_mention for e in self.evidence)
 
     @property
@@ -69,7 +75,15 @@ class Candidate(BaseModel):
 
     @property
     def reachable(self) -> bool:
-        return any(e.http_status is not None and e.http_status < 400 for e in self.evidence)
+        """403 и 429 — это антибот, а не отсутствие сайта: домен живой."""
+        return any(
+            e.http_status is not None and (e.http_status < 400 or e.http_status in (401, 403, 429))
+            for e in self.evidence
+        )
+
+    @property
+    def city_confirmed(self) -> bool:
+        return any(e.city_found for e in self.evidence)
 
     @property
     def best_name_similarity(self) -> float:
