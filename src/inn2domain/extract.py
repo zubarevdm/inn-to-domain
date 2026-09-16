@@ -119,7 +119,10 @@ def brand_matches_domain(brand: str | None, domain: str | None) -> float:
                 continue
             if translit == second_level:
                 return 1.0
+            # "resurs" внутри "gapresurs" это другая компания, а "transneft"
+            # внутри "transneft-service" та же самая. Разница в длине решает.
             if translit in second_level or second_level in translit:
-                best = max(best, 0.8)
+                gap = abs(len(second_level) - len(translit))
+                best = max(best, 0.85 if gap <= 2 else 0.6)
             best = max(best, fuzzy_ratio(translit, second_level))
     return round(best, 3)

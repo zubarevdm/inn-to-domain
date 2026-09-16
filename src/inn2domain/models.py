@@ -57,9 +57,12 @@ class Candidate(BaseModel):
     best_position: int = 99
     evidence: list[PageEvidence] = Field(default_factory=list)
     from_email: bool = False
+    from_inn_query: bool = False
+    inn_query_position: int = 99
     domain_created: str | None = None
     whois_owner: str | None = None
     whois_inn_match: bool = False
+    dns_ok: bool = False
     score: float = 0.0
     flags: list[str] = Field(default_factory=list)
 
@@ -75,11 +78,17 @@ class Candidate(BaseModel):
 
     @property
     def reachable(self) -> bool:
-        """403 и 429 — это антибот, а не отсутствие сайта: домен живой."""
-        return any(
-            e.http_status is not None and (e.http_status < 400 or e.http_status in (401, 403, 429))
-            for e in self.evidence
-        )
+        """Сайт существует, если сервер вообще ответил.
+
+        403, 423 и 429 это антибот, а не отсутствие сайта. Если ответа не было,
+        последним доводом остаётся DNS: домен делегирован, значит он живой,
+        а таймаут может быть особенностью нашей сети.
+        """
+        statuses = [e.http_status for e in self.evidence if e.http_status is not None]
+        if statuses:
+            # 5xx это сломанный сервер, а не работающий сайт
+            return any(status < 500 for status in statuses)
+        return bool(self.dns_ok)
 
     @property
     def city_confirmed(self) -> bool:

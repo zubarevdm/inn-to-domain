@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import socket
 import time
 
 from .cache import Cache
@@ -102,6 +103,8 @@ class Pipeline:
                 candidate.flags.append(RESTRICTED_FLAG)
             candidate.hits.append(hit)
             candidate.best_position = min(candidate.best_position, hit.position)
+            if company.inn in hit.query:
+                candidate.inn_query_position = min(candidate.inn_query_position, hit.position)
             if hit.query not in candidate.queries:
                 candidate.queries.append(hit.query)
         # Домены, упомянутые в тексте выдачи. Карточку агрегатора вернуть нельзя,
@@ -127,6 +130,7 @@ class Pipeline:
                 candidate = by_domain.setdefault(domain, Candidate(domain=domain))
                 candidate.from_email = True
         for candidate in by_domain.values():
+            candidate.from_inn_query = any(company.inn in q for q in candidate.queries)
             candidate.score = self._prior_score(candidate, company)
         return sorted(by_domain.values(), key=lambda c: -c.score)
 
@@ -138,6 +142,8 @@ class Pipeline:
         score += 0.35 * (len(candidate.queries) - 1)
         score += 0.6 if candidate.from_email else 0.0
         score += 0.8 if SNIPPET_FLAG in candidate.flags else 0.0
+        # запрос содержал ИНН, значит выдача описывает именно эту организацию
+        score += 0.7 if candidate.from_inn_query else 0.0
         score += 0.5 * brand_matches_domain(company.brand, candidate.domain)
         text = " ".join(f"{h.title} {h.snippet}" for h in candidate.hits)
         if company.inn in text.replace(" ", ""):
@@ -147,6 +153,11 @@ class Pipeline:
 
     def verify_candidate(self, candidate: Candidate, company: Company) -> None:
         """Качаем сайт и ищем на нём реквизиты организации."""
+        try:
+            socket.getaddrinfo(candidate.domain.encode("idna").decode(), None)
+            candidate.dns_ok = True
+        except Exception:
+            candidate.dns_ok = False
         org, whois_inn, created = whois_owner(candidate.domain, self.cache)
         candidate.domain_created = created
         candidate.whois_owner = org
@@ -385,75 +396,91 @@ class Pipeline:
     @staticmethod
     def _decide(result: Result, confirmed: list[Candidate], verdict: LLMVerdict | None) -> None:
         """Политика ответа. Неверный домен дороже, чем null, поэтому пороги жёсткие."""
-        top_confirmed = confirmed[0] if confirmed else None
+        brand = result.company.brand if result.company else None
 
-        if top_confirmed and (verdict is None or verdict.domain in (None, top_confirmed.domain)):
-            result.domain = top_confirmed.domain
-            result.confidence = 0.97 if verdict and verdict.domain else 0.9
-            result.reason = "Реквизиты организации опубликованы на сайте"
-            result.decided_by = "evidence"
-            return
+        def usable(candidate: Candidate) -> bool:
+            """Портал или агрегатор проходит, только если домен и есть бренд."""
+            if not _is_restricted_candidate(candidate):
+                return True
+            return brand_matches_domain(brand, candidate.domain) >= 0.75
 
-        if top_confirmed and verdict and verdict.domain and verdict.domain != top_confirmed.domain:
-            # расхождение фактов и модели: верим фактам, но уверенность снижаем
-            result.domain = top_confirmed.domain
-            result.confidence = 0.75
-            result.reason = (
-                "Реквизиты найдены на одном домене, LLM предложила другой. "
-                f"Выбран домен с реквизитами. Аргумент LLM: {verdict.reasoning}"
-            )
-            result.decided_by = "evidence-over-llm"
-            return
+        def support(candidate: Candidate) -> bool:
+            """Независимый признак принадлежности домена организации.
 
-        if verdict and verdict.domain and verdict.confidence >= CONFIDENT_LLM_THRESHOLD:
-            candidate = next((c for c in result.candidates if c.domain == verdict.domain), None)
-            if candidate is None or not candidate.reachable:
-                result.reason = "LLM выбрала домен, но сайт не открывается"
-                result.decided_by = "unreachable"
-                return
-            # Реквизитов нет, значит решение держится на косвенных признаках.
-            # Требуем хотя бы один независимый: название на странице, совпадение
-            # бренда с доменом или упоминание домена в карточке организации.
-            if _is_restricted_candidate(candidate) and not (
-                candidate.inn_confirmed
-                or candidate.ogrn_confirmed
-                or brand_matches_domain(
-                    result.company.brand if result.company else None, candidate.domain
+            Одного совпадения названия мало: у ООО "ПЛАСТ" из Петербурга и у
+            сайта plast.ru из Москвы название совпадает полностью, а компании
+            разные. Сильнейший из косвенных признаков — домен пришёл по запросу,
+            содержащему ИНН: значит выдача описывала именно эту организацию.
+            """
+            return (
+                (candidate.from_inn_query and candidate.inn_query_position <= 5)
+                or SNIPPET_FLAG in candidate.flags
+                or candidate.from_email
+                or (
+                    # Домен, равный бренду, сам по себе ничего не доказывает:
+                    # у ООО "ПЛАСТ" из Петербурга и у чужого plast.ru совпадение
+                    # полное. Нужен второй признак: город организации на странице
+                    # либо появление домена в выдаче по запросу с ИНН.
+                    brand_matches_domain(brand, candidate.domain) >= 0.85
+                    and (candidate.city_confirmed or candidate.from_inn_query)
                 )
-                >= 0.75
-            ):
-                # площадка с чужими реквизитами не может выиграть по мнению модели
+            )
+
+        confirmed = [c for c in confirmed if usable(c)]
+        top_confirmed = confirmed[0] if confirmed else None
+        llm_pick = None
+        if verdict and verdict.domain and verdict.confidence >= CONFIDENT_LLM_THRESHOLD:
+            llm_pick = next((c for c in result.candidates if c.domain == verdict.domain), None)
+            if llm_pick is not None and not usable(llm_pick):
                 result.reason = (
                     f"LLM выбрала портал или агрегатор ({verdict.domain}) "
                     "без подтверждения реквизитами"
                 )
                 result.decided_by = "restricted-without-evidence"
                 return
-            # Реквизитов нет, значит решение держится на косвенных признаках.
-            # Одного совпадения названия мало: у ООО "Пласт" из Петербурга и у
-            # сайта plast.ru из Москвы название совпадает полностью, а компании
-            # разные. Поэтому нужен либо адрес сайта из карточки организации,
-            # либо совпадение бренда с доменом вместе с городом на странице.
-            brand_match = brand_matches_domain(
-                result.company.brand if result.company else None, candidate.domain
-            )
-            support = (
-                SNIPPET_FLAG in candidate.flags
-                or candidate.from_email
-                or (brand_match >= 0.8 and candidate.city_confirmed)
-            )
-            if not support:
+
+        # Реквизиты и модель согласны либо модель молчит: отвечаем по реквизитам
+        if top_confirmed and (llm_pick is None or llm_pick.domain == top_confirmed.domain):
+            result.domain = top_confirmed.domain
+            result.confidence = 0.97 if llm_pick else 0.9
+            result.reason = "Реквизиты организации опубликованы на сайте"
+            result.decided_by = "evidence"
+            return
+
+        # Расходятся. ИНН организации публикуют у себя и партнёры, и филиалы,
+        # и агрегаторы, поэтому арбитром выступает модель: она видит контекст,
+        # в котором стоит номер. Её выбор всё равно проходит проверку на опору.
+        if llm_pick is not None:
+            if not llm_pick.reachable:
+                result.reason = "LLM выбрала домен, но сайт не отвечает и не резолвится"
+                result.decided_by = "unreachable"
+                return
+            if not support(llm_pick):
                 result.reason = (
-                    "Реквизитов на сайте нет, косвенные признаки слабые "
-                    f"(совпадение бренда {brand_match}, город на сайте "
-                    f"{candidate.city_confirmed}): версия LLM ({verdict.domain}) не принята"
+                    "Реквизитов на сайте нет, косвенные признаки слабые: "
+                    f"версия LLM ({verdict.domain}) не принята"
                 )
                 result.decided_by = "weak-support"
                 return
-            result.domain = verdict.domain
-            result.confidence = round(min(0.85, verdict.confidence), 2)
-            result.reason = verdict.reasoning or "Решение LLM по косвенным признакам"
-            result.decided_by = "llm"
+            result.domain = llm_pick.domain
+            if top_confirmed:
+                result.confidence = round(min(0.8, verdict.confidence), 2)
+                result.reason = (
+                    f"Реквизиты нашлись на {top_confirmed.domain}, но это сторонняя площадка. "
+                    f"Выбран домен LLM: {verdict.reasoning}"
+                )
+                result.decided_by = "llm-over-evidence"
+            else:
+                result.confidence = round(min(0.85, verdict.confidence), 2)
+                result.reason = verdict.reasoning or "Решение LLM по косвенным признакам"
+                result.decided_by = "llm"
+            return
+
+        if top_confirmed:
+            result.domain = top_confirmed.domain
+            result.confidence = 0.8
+            result.reason = "Реквизиты опубликованы на сайте, LLM уверенного ответа не дала"
+            result.decided_by = "evidence"
             return
 
         result.reason = (

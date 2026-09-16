@@ -40,6 +40,12 @@ RESTRICTED_DOMAINS = {
     "1prime.ru", "klerk.ru", "b2b-center.ru", "vbr.ru", "sravni.ru", "pikabu.ru",
     "rusbase.com", "zaimo.ru", "sbercrm.ru", "companies.wiki", "kompaniya.org",
     "sbis.com", "ru-bezh.ru", "vipiska-nalog.com", "egrul.ru", "ogrn.ru",
+    "companium.ru", "xfirm.ru", "b2b-69.ru", "companies.wiki", "kompaniya.org",
+    # финансовые и биржевые справочники, рейтинги, закупочные площадки
+    "banki.ru", "bankiros.ru", "brobank.ru", "1000bankov.ru", "moex.com",
+    "cbonds.ru", "rusbonds.ru", "raexpert.ru", "raex-rr.com", "acra-ratings.ru",
+    "otc.ru", "tender.pro", "alta.ru", "rts-tender.ru", "roseltorg.ru",
+    "lichniekabineti.ru", "mojkabinet.ru", "rsr-online.ru", "onrender.com",
     # сайты банков и сервисов со встроенной проверкой контрагентов
     "saby.ru", "tochka.com", "tbank.ru", "alfabank.ru", "sberbank.ru", "vtb.ru",
     "modulbank.ru", "psbank.ru", "open.ru", "raiffeisen.ru", "gazprombank.ru",
