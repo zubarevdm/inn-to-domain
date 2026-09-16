@@ -97,19 +97,12 @@ class PageFetcher:
         self.cache = cache
         self.timeout = timeout
 
-    def get(self, url: str) -> tuple[int | None, str, str | None]:
-        """Возвращает (http-статус, html, ошибка). Ошибки сети — часть данных,
-        недоступный сайт это сигнал, а не повод падать."""
-        cached = self.cache.get("page", {"url": url})
-        if cached is not None:
-            return cached.get("status"), cached.get("html", ""), cached.get("error")
-        status: int | None = None
-        html = ""
-        error: str | None = None
+    def _download(self, url: str, verify: bool) -> tuple[int | None, str, str | None]:
         try:
-            with new_client(trust_env=self.settings.http_trust_env, timeout=self.timeout) as client:
+            with new_client(
+                trust_env=self.settings.http_trust_env, timeout=self.timeout, verify=verify
+            ) as client:
                 with client.stream("GET", url) as response:
-                    status = response.status_code
                     chunks: list[bytes] = []
                     size = 0
                     for chunk in response.iter_bytes():
@@ -117,10 +110,31 @@ class PageFetcher:
                         size += len(chunk)
                         if size >= MAX_BYTES:
                             break
-                    html = decode(b"".join(chunks), response.charset_encoding)
-        except httpx.HTTPError as exc:
-            error = f"{type(exc).__name__}: {exc}"[:200]
-        except Exception as exc:  # битый TLS, редирект в никуда и прочая экзотика рунета
-            error = f"{type(exc).__name__}: {exc}"[:200]
-        self.cache.set("page", {"url": url}, {"status": status, "html": html[:200_000], "error": error})
+                    return (
+                        response.status_code,
+                        decode(b"".join(chunks), response.charset_encoding),
+                        None,
+                    )
+        except Exception as exc:  # обрыв TLS, редирект в никуда и прочая экзотика рунета
+            return None, "", f"{type(exc).__name__}: {exc}"[:200]
+
+    def get(self, url: str) -> tuple[int | None, str, str | None]:
+        """Возвращает (http-статус, html, ошибка). Ошибки сети — часть данных,
+        недоступный сайт это сигнал, а не повод падать."""
+        cached = self.cache.get("page", {"url": url})
+        if cached is not None:
+            return cached.get("status"), cached.get("html", ""), cached.get("error")
+
+        status, html, error = self._download(url, verify=True)
+        if error and "CERTIFICATE_VERIFY_FAILED" in error:
+            # Крупные российские сайты (sberbank.ru, vtb.ru, gazprom.ru) выпускают
+            # сертификаты в НУЦ Минцифры, чей корень не входит в бандл certifi.
+            # Мы читаем публичные страницы ради реквизитов, конфиденциальных
+            # данных не передаём, поэтому здесь повтор без проверки цепочки.
+            status, html, retry_error = self._download(url, verify=False)
+            error = retry_error or "сертификат не проверен (НУЦ Минцифры)"
+
+        self.cache.set(
+            "page", {"url": url}, {"status": status, "html": html[:200_000], "error": error}
+        )
         return status, html, error
